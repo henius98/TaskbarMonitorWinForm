@@ -1,639 +1,260 @@
+using LibreHardwareMonitor.Hardware;
+using Microsoft.VisualBasic.Devices;
 using System;
-using System.Buffers;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using System.Diagnostics;
 using System.Linq;
 using System.Net.NetworkInformation;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Forms;
+using Computer = LibreHardwareMonitor.Hardware.Computer;
+using Timer = System.Windows.Forms.Timer;
 
-namespace TaskbarMonitor
+
+namespace TaskbarSystemMonitor
 {
-    public sealed partial class Program : Form, IDisposable
+    public partial class MainForm : Form
     {
-        // Three separate tray icons for independent charts
-        private NotifyIcon? cpuTrayIcon;
-        private NotifyIcon? ramTrayIcon;
-        private NotifyIcon? networkTrayIcon;
-
-        private System.Threading.Timer? updateTimer;
-        private PerformanceCounter? cpuCounter;
-        private PerformanceCounter? ramCounter;
-        private PerformanceCounter? totalRamCounter;
-        private NetworkInterface[]? networkInterfaces;
+        private NotifyIcon notifyIcon;
+        private Computer computer;
+        private Timer updateTimer;
+        private List<float> cpuHistory = new List<float>();
+        private List<float> ramHistory = new List<float>();
+        private List<float> networkHistory = new List<float>();
         private long lastBytesReceived = 0;
-        private long lastBytesSent = 0;
-        private long lastNetworkCheck = Environment.TickCount64;
+        private DateTime lastNetworkCheck = DateTime.Now;
+        private const int HISTORY_SIZE = 60; // Keep 60 data points
 
-        // Use circular buffers for better performance
-        private const int HistorySize = 20;
-        private readonly CircularBuffer<float> cpuHistory = new(HistorySize);
-        private readonly CircularBuffer<float> ramHistory = new(HistorySize);
-        private readonly CircularBuffer<float> networkHistory = new(HistorySize);
-
-        private volatile float currentCpu = 0;
-        private volatile float currentRam = 0;
-        private volatile float currentNetwork = 0; // KB/s
-
-        // Cache for performance - separate icons for each metric
-        private Icon? lastCpuIcon;
-        private Icon? lastRamIcon;
-        private Icon? lastNetworkIcon;
-        private readonly object iconLock = new();
-        private bool disposed = false;
-
-        public Program()
+        public MainForm()
         {
             InitializeComponent();
-            _ = InitializeMonitoringAsync();
-            CreateTrayIcons();
-            WindowState = FormWindowState.Minimized;
-            ShowInTaskbar = false;
-            Visible = false;
+            InitializeSystemMonitor();
+            SetupTaskbarIcon();
+            StartMonitoring();
+
+            // Hide the form immediately
+            this.WindowState = FormWindowState.Minimized;
+            this.ShowInTaskbar = false;
+            this.Visible = false;
         }
 
         private void InitializeComponent()
         {
-            Text = "System Monitor";
-            Size = new Size(1, 1);
-            FormBorderStyle = FormBorderStyle.None;
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.DoubleBuffer, true);
+            this.SuspendLayout();
+            this.AutoScaleDimensions = new SizeF(6F, 13F);
+            this.AutoScaleMode = AutoScaleMode.Font;
+            this.ClientSize = new Size(0, 0);
+            this.FormBorderStyle = FormBorderStyle.None;
+            this.Name = "MainForm";
+            this.Text = "System Monitor";
+            this.ResumeLayout(false);
         }
 
-        private async Task InitializeMonitoringAsync()
+        private void InitializeSystemMonitor()
+        {
+            computer = new Computer
+            {
+                IsCpuEnabled = true,
+                IsMemoryEnabled = true,
+                IsNetworkEnabled = true
+            };
+            computer.Open();
+        }
+
+        private void SetupTaskbarIcon()
+        {
+            notifyIcon = new NotifyIcon();
+            notifyIcon.Icon = CreateMonitorIcon();
+            notifyIcon.Visible = true;
+            notifyIcon.Text = "System Monitor";
+
+            // Context menu
+            ContextMenuStrip contextMenu = new ContextMenuStrip();
+            contextMenu.Items.Add("Exit", null, (s, e) => Application.Exit());
+            notifyIcon.ContextMenuStrip = contextMenu;
+        }
+
+        private void StartMonitoring()
+        {
+            updateTimer = new Timer();
+            updateTimer.Interval = 1000; // Update every second
+            updateTimer.Tick += UpdateSystemInfo;
+            updateTimer.Start();
+        }
+
+        private void UpdateSystemInfo(object sender, EventArgs e)
         {
             try
             {
-                // Initialize performance counters on background thread
-                await Task.Run(() =>
-                {
-                    cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                    ramCounter = new PerformanceCounter("Memory", "Available MBytes");
-                    totalRamCounter = new PerformanceCounter("Memory", "Committed Bytes");
+                computer.Accept(new UpdateVisitor());
 
-                    networkInterfaces = NetworkInterface.GetAllNetworkInterfaces()
-                        .Where(static ni => ni.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                                    ni.OperationalStatus == OperationalStatus.Up)
-                        .ToArray();
+                // Get CPU usage
+                float cpuUsage = GetCpuUsage();
+                cpuHistory.Add(cpuUsage);
+                if (cpuHistory.Count > HISTORY_SIZE) cpuHistory.RemoveAt(0);
 
-                    // First reading (CPU counter needs a baseline)
-                    cpuCounter.NextValue();
-                });
+                // Get RAM usage
+                float ramUsage = GetRamUsage();
+                ramHistory.Add(ramUsage);
+                if (ramHistory.Count > HISTORY_SIZE) ramHistory.RemoveAt(0);
 
-                // Use high-resolution timer
-                updateTimer = new System.Threading.Timer(UpdateTimerCallback, null, 1000, 1000);
+                // Get Network speed
+                float networkSpeed = GetNetworkSpeed();
+                networkHistory.Add(networkSpeed);
+                if (networkHistory.Count > HISTORY_SIZE) networkHistory.RemoveAt(0);
+
+                // Update taskbar icon
+                notifyIcon.Icon = CreateMonitorIcon();
+                notifyIcon.Text = $"CPU: {cpuUsage:F1}%\nRAM: {ramUsage:F1}%\nNet: {networkSpeed:F1} MB/s";
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Error initializing performance counters: {ex.Message}");
+                // Handle errors silently to keep the app running
+                System.Diagnostics.Debug.WriteLine($"Error updating system info: {ex.Message}");
             }
         }
 
-        private void CreateTrayIcons()
-        {
-            // CPU Monitor Icon
-            cpuTrayIcon = new NotifyIcon()
-            {
-                Icon = CreateIconWithText("CPU", Color.FromArgb(255, 60, 60)),
-                Visible = true,
-                Text = "CPU Monitor - Initializing..."
-            };
-
-            // RAM Monitor Icon
-            ramTrayIcon = new NotifyIcon()
-            {
-                Icon = CreateIconWithText("RAM", Color.FromArgb(60, 120, 255)),
-                Visible = true,
-                Text = "RAM Monitor - Initializing..."
-            };
-
-            // Network Monitor Icon
-            networkTrayIcon = new NotifyIcon()
-            {
-                Icon = CreateIconWithText("NET", Color.FromArgb(60, 255, 60)),
-                Visible = true,
-                Text = "Network Monitor - Initializing..."
-            };
-
-            // Context menus for each icon
-            var exitMenuItem = new ToolStripMenuItem("Exit All Monitors", null, (s, e) =>
-            {
-                if (!disposed)
-                {
-                    Application.Exit();
-                }
-            });
-
-            var cpuContextMenu = new ContextMenuStrip();
-            cpuContextMenu.Items.Add("CPU Monitor", null).Enabled = false;
-            cpuContextMenu.Items.Add(new ToolStripSeparator());
-            cpuContextMenu.Items.Add(exitMenuItem);
-            cpuTrayIcon.ContextMenuStrip = cpuContextMenu;
-
-            var ramContextMenu = new ContextMenuStrip();
-            ramContextMenu.Items.Add("RAM Monitor", null).Enabled = false;
-            ramContextMenu.Items.Add(new ToolStripSeparator());
-            ramContextMenu.Items.Add(exitMenuItem);
-            ramTrayIcon.ContextMenuStrip = ramContextMenu;
-
-            var networkContextMenu = new ContextMenuStrip();
-            networkContextMenu.Items.Add("Network Monitor", null).Enabled = false;
-            networkContextMenu.Items.Add(new ToolStripSeparator());
-            networkContextMenu.Items.Add(exitMenuItem);
-            networkTrayIcon.ContextMenuStrip = networkContextMenu;
-
-            // Double click handlers
-            cpuTrayIcon.DoubleClick += (s, e) => ToggleVisibility();
-            ramTrayIcon.DoubleClick += (s, e) => ToggleVisibility();
-            networkTrayIcon.DoubleClick += (s, e) => ToggleVisibility();
-        }
-
-        private void UpdateTimerCallback(object? state)
-        {
-            if (disposed) return;
-
-            try
-            {
-                // Capture all metrics in parallel
-                var tasks = new Task<(string type, float value)>[]
-                {
-                    Task.Run(() => ("CPU", GetCpuUsage())),
-                    Task.Run(() => ("RAM", GetRamUsage())),
-                    Task.Run(() => ("NET", GetNetworkUsage()))
-                };
-
-                Task.WaitAll(tasks, 800); // Timeout to prevent hanging
-
-                foreach (var task in tasks)
-                {
-                    if (task.IsCompletedSuccessfully)
-                    {
-                        var (type, value) = task.Result;
-                        switch (type)
-                        {
-                            case "CPU":
-                                currentCpu = value;
-                                cpuHistory.Add(value);
-                                break;
-                            case "RAM":
-                                currentRam = value;
-                                ramHistory.Add(value);
-                                break;
-                            case "NET":
-                                currentNetwork = value;
-                                networkHistory.Add(value);
-                                break;
-                        }
-                    }
-                }
-
-                // Update UI on main thread
-                if (InvokeRequired)
-                {
-                    BeginInvoke(UpdateTrayIcons);
-                }
-                else
-                {
-                    UpdateTrayIcons();
-                }
-            }
-            catch (Exception ex)
-            {
-                // Silently handle errors to keep running
-                System.Diagnostics.Debug.WriteLine($"Update error: {ex.Message}");
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private float GetCpuUsage()
         {
-            return cpuCounter?.NextValue() ?? 0f;
+            var cpuSensors = computer.Hardware
+                .Where(h => h.HardwareType == HardwareType.Cpu)
+                .SelectMany(h => h.Sensors)
+                .Where(s => s.SensorType == SensorType.Load && s.Name == "CPU Total");
+
+            return cpuSensors.FirstOrDefault()?.Value ?? 0;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private float GetRamUsage()
         {
-            if (ramCounter == null) return 0f;
+            var memorySensors = computer.Hardware
+                .Where(h => h.HardwareType == HardwareType.Memory)
+                .SelectMany(h => h.Sensors)
+                .Where(s => s.SensorType == SensorType.Load);
 
+            return memorySensors.FirstOrDefault()?.Value ?? 0;
+        }
+
+        private float GetNetworkSpeed()
+        {
             try
             {
-                // Get available RAM in MB
-                var availableRamMB = ramCounter.NextValue();
+                var interfaces = NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(ni => ni.OperationalStatus == OperationalStatus.Up &&
+                               ni.NetworkInterfaceType != NetworkInterfaceType.Loopback);
 
-                // Get total physical memory using Win32 API for accuracy
-                var totalRamMB = GetTotalPhysicalMemoryMB();
+                long currentBytesReceived = interfaces.Sum(ni => ni.GetIPStatistics().BytesReceived);
+                DateTime currentTime = DateTime.Now;
 
-                if (totalRamMB <= 0 || availableRamMB < 0)
-                    return 0f;
+                if (lastBytesReceived > 0)
+                {
+                    double timeDiff = (currentTime - lastNetworkCheck).TotalSeconds;
+                    double bytesDiff = currentBytesReceived - lastBytesReceived;
+                    double mbps = (bytesDiff / timeDiff) / (1024 * 1024); // Convert to MB/s
 
-                // Calculate used RAM percentage
-                var usedRamMB = Math.Max(0, totalRamMB - availableRamMB);
-                var ramUsagePercent = (usedRamMB / totalRamMB) * 100f;
+                    lastBytesReceived = currentBytesReceived;
+                    lastNetworkCheck = currentTime;
 
-                // Clamp to valid range
-                return Math.Clamp(ramUsagePercent, 0f, 100f);
+                    return (float)Math.Max(0, mbps);
+                }
+
+                lastBytesReceived = currentBytesReceived;
+                lastNetworkCheck = currentTime;
+                return 0;
             }
             catch
             {
-                return 0f;
+                return 0;
             }
         }
 
-        private float GetNetworkUsage()
+        private Icon CreateMonitorIcon()
         {
-            if (networkInterfaces == null) return 0f;
+            const int size = 16;
+            Bitmap bitmap = new Bitmap(size, size);
 
-            try
+            using (Graphics g = Graphics.FromImage(bitmap))
             {
-                long totalBytes = 0;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
 
-                // Use LINQ for better performance with modern .NET
-                totalBytes = networkInterfaces
-                    .AsParallel()
-                    .Where(static ni => ni.OperationalStatus == OperationalStatus.Up)
-                    .Sum(static ni =>
-                    {
-                        try
-                        {
-                            var stats = ni.GetIPv4Statistics();
-                            return stats.BytesReceived + stats.BytesSent;
-                        }
-                        catch
-                        {
-                            return 0L;
-                        }
-                    });
+                // Draw CPU chart (red)
+                DrawMiniChart(g, cpuHistory, Color.Red, new Rectangle(0, 0, 5, size));
 
-                var currentTicks = Environment.TickCount64;
-                var timeDiffMs = currentTicks - lastNetworkCheck;
+                // Draw RAM chart (blue)
+                DrawMiniChart(g, ramHistory, Color.Blue, new Rectangle(6, 0, 5, size));
 
-                if (lastBytesReceived > 0 && timeDiffMs > 0)
-                {
-                    var bytesDiff = totalBytes - (lastBytesReceived + lastBytesSent);
-                    var kbps = (float)(bytesDiff / (timeDiffMs / 1000.0) / 1024.0);
-
-                    lastBytesReceived = totalBytes / 2; // Approximate split
-                    lastBytesSent = totalBytes / 2;
-                    lastNetworkCheck = currentTicks;
-
-                    return Math.Max(0, kbps);
-                }
-
-                lastBytesReceived = totalBytes / 2;
-                lastBytesSent = totalBytes / 2;
-                lastNetworkCheck = currentTicks;
-                return 0f;
+                // Draw Network chart (green)
+                DrawMiniChart(g, networkHistory, Color.Green, new Rectangle(12, 0, 4, size));
             }
-            catch
-            {
-                return 0f;
-            }
-        }
-
-        private void UpdateTrayIcons()
-        {
-            if (disposed) return;
-
-            // Update CPU Icon
-            if (cpuTrayIcon != null)
-            {
-                cpuTrayIcon.Text = $"CPU: {currentCpu:F1}%";
-                lock (iconLock)
-                {
-                    var newIcon = CreateCpuIcon();
-                    var oldIcon = lastCpuIcon;
-                    lastCpuIcon = newIcon;
-                    cpuTrayIcon.Icon = newIcon;
-                    oldIcon?.Dispose();
-                }
-            }
-
-            // Update RAM Icon
-            if (ramTrayIcon != null)
-            {
-                ramTrayIcon.Text = $"RAM: {currentRam:F1}%";
-                lock (iconLock)
-                {
-                    var newIcon = CreateRamIcon();
-                    var oldIcon = lastRamIcon;
-                    lastRamIcon = newIcon;
-                    ramTrayIcon.Icon = newIcon;
-                    oldIcon?.Dispose();
-                }
-            }
-
-            // Update Network Icon
-            if (networkTrayIcon != null)
-            {
-                networkTrayIcon.Text = $"Network: {FormatNetworkSpeed(currentNetwork)}";
-                lock (iconLock)
-                {
-                    var newIcon = CreateNetworkIcon();
-                    var oldIcon = lastNetworkIcon;
-                    lastNetworkIcon = newIcon;
-                    networkTrayIcon.Icon = newIcon;
-                    oldIcon?.Dispose();
-                }
-            }
-        }
-
-        private Icon CreateCpuIcon()
-        {
-            using var bitmap = new Bitmap(16, 16);
-            using var g = Graphics.FromImage(bitmap);
-
-            g.Clear(Color.Transparent);
-            g.SmoothingMode = SmoothingMode.HighQuality;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-
-            // Draw CPU chart
-            DrawFullChart(g, cpuHistory.GetData(), new Rectangle(0, 0, 16, 16), Color.FromArgb(255, 60, 60));
-
-            // Draw current value text
-            using var font = new Font("Segoe UI", 6, FontStyle.Bold);
-            var text = $"{currentCpu:F0}";
-            var textColor = currentCpu > 80 ? Color.White : Color.FromArgb(200, 200, 200);
-            using var brush = new SolidBrush(textColor);
-            g.DrawString(text, font, brush, 1, 1);
 
             return Icon.FromHandle(bitmap.GetHicon());
         }
 
-        private Icon CreateRamIcon()
+        private void DrawMiniChart(Graphics g, List<float> data, Color color, Rectangle bounds)
         {
-            using var bitmap = new Bitmap(16, 16);
-            using var g = Graphics.FromImage(bitmap);
+            if (data.Count < 2) return;
 
-            g.Clear(Color.Transparent);
-            g.SmoothingMode = SmoothingMode.HighQuality;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-
-            // Draw RAM chart
-            DrawFullChart(g, ramHistory.GetData(), new Rectangle(0, 0, 16, 16), Color.FromArgb(60, 120, 255));
-
-            // Draw current value text
-            using var font = new Font("Segoe UI", 6, FontStyle.Bold);
-            var text = $"{currentRam:F0}";
-            var textColor = currentRam > 80 ? Color.White : Color.FromArgb(200, 200, 200);
-            using var brush = new SolidBrush(textColor);
-            g.DrawString(text, font, brush, 1, 1);
-
-            return Icon.FromHandle(bitmap.GetHicon());
-        }
-
-        private Icon CreateNetworkIcon()
-        {
-            using var bitmap = new Bitmap(16, 16);
-            using var g = Graphics.FromImage(bitmap);
-
-            g.Clear(Color.Transparent);
-            g.SmoothingMode = SmoothingMode.HighQuality;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-
-            // Normalize network data for chart (scale to 0-100 range)
-            var networkData = networkHistory.GetData();
-            var maxValue = networkData.Length > 0 ? Math.Max(networkData.ToArray().Max(), 1000f) : 1000f; // Min scale 1MB/s
-            var normalizedData = new float[networkData.Length];
-            for (int i = 0; i < networkData.Length; i++)
+            using (Pen pen = new Pen(color, 1))
             {
-                normalizedData[i] = (networkData[i] / maxValue) * 100f;
-            }
+                float maxValue = Math.Max(data.Max(), 1); // Avoid division by zero
 
-            // Draw Network chart
-            DrawFullChart(g, normalizedData, new Rectangle(0, 0, 16, 16), Color.FromArgb(60, 255, 60));
-
-            // Draw current value text (show speed units)
-            using var font = new Font("Segoe UI", 5, FontStyle.Bold);
-            var text = currentNetwork < 1024 ? $"{currentNetwork:F0}K" : $"{currentNetwork / 1024:F1}M";
-            var textColor = Color.FromArgb(200, 255, 200);
-            using var brush = new SolidBrush(textColor);
-            g.DrawString(text, font, brush, 1, 1);
-
-            return Icon.FromHandle(bitmap.GetHicon());
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void DrawFullChart(Graphics g, ReadOnlySpan<float> data, Rectangle bounds, Color color)
-        {
-            if (data.Length < 2) return;
-
-            // Rent array from pool for better performance
-            var pointsArray = ArrayPool<PointF>.Shared.Rent(data.Length);
-            try
-            {
-                var points = pointsArray.AsSpan(0, data.Length);
-
-                for (int i = 0; i < data.Length; i++)
+                for (int i = 1; i < data.Count; i++)
                 {
-                    float x = bounds.X + (float)i / (data.Length - 1) * bounds.Width;
-                    float normalizedValue = Math.Clamp(data[i] / 100f, 0f, 1f);
-                    float y = bounds.Bottom - normalizedValue * bounds.Height;
-                    points[i] = new PointF(x, y);
-                }
+                    float x1 = bounds.X + (float)(i - 1) * bounds.Width / (data.Count - 1);
+                    float y1 = bounds.Bottom - (data[i - 1] / maxValue) * bounds.Height;
+                    float x2 = bounds.X + (float)i * bounds.Width / (data.Count - 1);
+                    float y2 = bounds.Bottom - (data[i] / maxValue) * bounds.Height;
 
-                // Draw background
-                using var backgroundBrush = new SolidBrush(Color.FromArgb(30, 0, 0, 0));
-                g.FillRectangle(backgroundBrush, bounds);
-
-                // Draw chart line
-                using var pen = new Pen(color, 1.5f);
-                if (points.Length > 1)
-                {
-                    g.DrawLines(pen, points.ToArray());
-                }
-
-                // Fill area under curve for better visibility
-                if (points.Length > 1)
-                {
-                    var fillPoints = new PointF[points.Length + 2];
-                    points.ToArray().CopyTo(fillPoints, 0);
-                    fillPoints[points.Length] = new PointF(bounds.Right, bounds.Bottom);
-                    fillPoints[points.Length + 1] = new PointF(bounds.Left, bounds.Bottom);
-
-                    using var fillBrush = new SolidBrush(Color.FromArgb(50, color.R, color.G, color.B));
-                    g.FillPolygon(fillBrush, fillPoints);
+                    g.DrawLine(pen, x1, y1, x2, y2);
                 }
             }
-            finally
-            {
-                ArrayPool<PointF>.Shared.Return(pointsArray);
-            }
-        }
-
-        private static Icon CreateIconWithText(string text, Color color)
-        {
-            using var bitmap = new Bitmap(16, 16);
-            using var g = Graphics.FromImage(bitmap);
-
-            g.Clear(Color.FromArgb(40, 40, 40));
-            using var font = new Font("Segoe UI", 5, FontStyle.Bold);
-            using var brush = new SolidBrush(color);
-            g.DrawString(text, font, brush, 1, 5);
-
-            return Icon.FromHandle(bitmap.GetHicon());
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float GetTotalPhysicalMemoryMB()
-        {
-            try
-            {
-                // Use WMI for accurate total memory detection
-                using var searcher = new System.Management.ManagementObjectSearcher("SELECT TotalPhysicalMemory FROM Win32_ComputerSystem");
-                foreach (System.Management.ManagementObject obj in searcher.Get())
-                {
-                    var totalMemoryBytes = Convert.ToInt64(obj["TotalPhysicalMemory"]);
-                    return totalMemoryBytes / (1024f * 1024f); // Convert to MB
-                }
-            }
-            catch
-            {
-                // Fallback: estimate from GC and available memory
-                try
-                {
-                    using var availableCounter = new PerformanceCounter("Memory", "Available Bytes");
-                    var availableBytes = availableCounter.NextValue();
-                    return (availableBytes + GC.GetTotalMemory(false)) / (1024f * 1024f);
-                }
-                catch
-                {
-                    return 8192f; // Default fallback (8GB)
-                }
-            }
-            return 0f;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static string FormatNetworkSpeed(float kbps)
-        {
-            return kbps < 1024
-                ? $"{kbps:F1} KB/s"
-                : $"{kbps / 1024:F1} MB/s";
-        }
-
-        private void ToggleVisibility()
-        {
-            if (Visible)
-            {
-                Hide();
-            }
-            else
-            {
-                Show();
-                WindowState = FormWindowState.Normal;
-                BringToFront();
-            }
-        }
-
-        protected override void SetVisibleCore(bool value)
-        {
-            base.SetVisibleCore(false);
-        }
-
-        public new void Dispose()
-        {
-            Dispose(true);
-            GC.SuppressFinalize(this);
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (!disposed && disposing)
+            if (disposing)
             {
-                disposed = true;
-
+                updateTimer?.Stop();
                 updateTimer?.Dispose();
-                cpuCounter?.Dispose();
-                ramCounter?.Dispose();
-                totalRamCounter?.Dispose();
-
-                lock (iconLock)
-                {
-                    lastCpuIcon?.Dispose();
-                    lastRamIcon?.Dispose();
-                    lastNetworkIcon?.Dispose();
-                }
-
-                cpuTrayIcon?.Dispose();
-                ramTrayIcon?.Dispose();
-                networkTrayIcon?.Dispose();
+                computer?.Close();
+                notifyIcon?.Dispose();
             }
             base.Dispose(disposing);
         }
 
-        [STAThread]
-        public static void Main()
+        protected override void SetVisibleCore(bool value)
         {
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
-
-            // Ensure only one instance with better performance
-            using var mutex = new Mutex(true, "TaskbarSystemMonitor_v2", out bool createdNew);
-            if (createdNew)
-            {
-                // Set process priority for better responsiveness
-                using var currentProcess = Process.GetCurrentProcess();
-                currentProcess.PriorityClass = ProcessPriorityClass.High;
-
-                Application.Run(new Program());
-            }
-            else
-            {
-                MessageBox.Show("System Monitor is already running.", "Taskbar Monitor",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
+            base.SetVisibleCore(false); // Never show the form
         }
     }
 
-    // High-performance circular buffer implementation
-    public sealed class CircularBuffer<T> where T : struct
+    public class UpdateVisitor : IVisitor
     {
-        private readonly T[] buffer;
-        private readonly int capacity;
-        private int head = 0;
-        private int count = 0;
-        private readonly object lockObj = new();
-
-        public CircularBuffer(int capacity)
+        public void VisitComputer(IComputer computer)
         {
-            this.capacity = capacity;
-            buffer = new T[capacity];
+            computer.Traverse(this);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Add(T item)
+        public void VisitHardware(IHardware hardware)
         {
-            lock (lockObj)
-            {
-                buffer[head] = item;
-                head = (head + 1) % capacity;
-                if (count < capacity)
-                    count++;
-            }
+            hardware.Update();
+            foreach (IHardware subHardware in hardware.SubHardware)
+                subHardware.Accept(this);
         }
 
-        public ReadOnlySpan<T> GetData()
+        public void VisitSensor(ISensor sensor) { }
+        public void VisitParameter(IParameter parameter) { }
+    }
+
+    static class Program
+    {
+        [STAThread]
+        static void Main()
         {
-            lock (lockObj)
-            {
-                if (count == 0)
-                    return ReadOnlySpan<T>.Empty;
-
-                var result = new T[count];
-                var start = count == capacity ? head : 0;
-
-                for (int i = 0; i < count; i++)
-                {
-                    result[i] = buffer[(start + i) % capacity];
-                }
-
-                return result;
-            }
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
         }
     }
 }
