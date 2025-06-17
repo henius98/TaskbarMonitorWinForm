@@ -1,4 +1,3 @@
-
 using System.Drawing.Drawing2D;
 using System.Net.NetworkInformation;
 using LibreHardwareMonitor.Hardware;
@@ -18,7 +17,13 @@ namespace TaskbarSystemMonitor
         private List<float> networkHistory = new List<float>();
         private long lastBytesReceived = 0;
         private DateTime lastNetworkCheck = DateTime.Now;
-        private const int HISTORY_SIZE = 60; // Keep 60 data points
+
+        // Chart drawing constants
+        private const int ICON_SIZE = 32;
+        private const int POINT_WIDTH = 2;
+        private const int BORDER_WIDTH = 1;
+        private readonly Color backgroundColor = Color.FromArgb(20, 20, 20);
+        private readonly Color borderColor = Color.FromArgb(80, 80, 80);
 
         public MainForm()
         {
@@ -60,21 +65,21 @@ namespace TaskbarSystemMonitor
         {
             // Setup CPU tray icon
             cpuNotifyIcon = new NotifyIcon();
-            cpuNotifyIcon.Icon = CreateCpuIcon();
+            cpuNotifyIcon.Icon = CreateCpuIcon(0);
             cpuNotifyIcon.Visible = true;
             cpuNotifyIcon.Text = "CPU Monitor";
             cpuNotifyIcon.ContextMenuStrip = CreateContextMenu("CPU Monitor");
 
             // Setup RAM tray icon
             ramNotifyIcon = new NotifyIcon();
-            ramNotifyIcon.Icon = CreateRamIcon();
+            ramNotifyIcon.Icon = CreateRamIcon(0, 0, 0);
             ramNotifyIcon.Visible = true;
             ramNotifyIcon.Text = "RAM Monitor";
             ramNotifyIcon.ContextMenuStrip = CreateContextMenu("RAM Monitor");
 
             // Setup Network tray icon
             networkNotifyIcon = new NotifyIcon();
-            networkNotifyIcon.Icon = CreateNetworkIcon();
+            networkNotifyIcon.Icon = CreateNetworkIcon(0);
             networkNotifyIcon.Visible = true;
             networkNotifyIcon.Text = "Network Monitor";
             networkNotifyIcon.ContextMenuStrip = CreateContextMenu("Network Monitor");
@@ -105,27 +110,21 @@ namespace TaskbarSystemMonitor
 
                 // Get CPU usage
                 float cpuUsage = GetCpuUsage();
-                cpuHistory.Add(cpuUsage);
-                if (cpuHistory.Count > HISTORY_SIZE) cpuHistory.RemoveAt(0);
 
                 // Get RAM usage
-                float ramUsage = GetRamUsage();
-                ramHistory.Add(ramUsage);
-                if (ramHistory.Count > HISTORY_SIZE) ramHistory.RemoveAt(0);
+                GetRamUsage(out float ramUsage, out float ramAvailable, out float ramTotal);
 
                 // Get Network speed
                 float networkSpeed = GetNetworkSpeed();
-                networkHistory.Add(networkSpeed);
-                if (networkHistory.Count > HISTORY_SIZE) networkHistory.RemoveAt(0);
 
-                // Update individual taskbar icons
-                cpuNotifyIcon.Icon = CreateCpuIcon();
+                // Update individual taskbar icons with enhanced charts
+                cpuNotifyIcon.Icon = CreateCpuIcon(cpuUsage);
                 cpuNotifyIcon.Text = $"CPU: {cpuUsage:F1}%";
 
-                ramNotifyIcon.Icon = CreateRamIcon();
-                ramNotifyIcon.Text = $"RAM: {ramUsage:F1}%";
+                ramNotifyIcon.Icon = CreateRamIcon(ramUsage, ramAvailable, ramTotal);
+                ramNotifyIcon.Text = $"RAM: {((ramTotal - ramAvailable) / 1073741824):F1} / {(ramTotal / 1073741824):F1} GB ({ramUsage:F0}%)";
 
-                networkNotifyIcon.Icon = CreateNetworkIcon();
+                networkNotifyIcon.Icon = CreateNetworkIcon(networkSpeed);
                 networkNotifyIcon.Text = $"Network: {networkSpeed:F1} MB/s";
             }
             catch (Exception ex)
@@ -145,14 +144,28 @@ namespace TaskbarSystemMonitor
             return cpuSensors.FirstOrDefault()?.Value ?? 0;
         }
 
-        private float GetRamUsage()
+        private void GetRamUsage(out float ramUsage, out float ramAvailable, out float ramTotal)
         {
-            var memorySensors = computer.Hardware
-                .Where(h => h.HardwareType == HardwareType.Memory)
-                .SelectMany(h => h.Sensors)
-                .Where(s => s.SensorType == SensorType.Load);
+            var memoryHardware = computer.Hardware.FirstOrDefault(h => h.HardwareType == HardwareType.Memory);
 
-            return memorySensors.FirstOrDefault()?.Value ?? 0;
+            if (memoryHardware != null)
+            {
+                var usedSensor = memoryHardware.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Data && s.Name == "Memory Used");
+                var availableSensor = memoryHardware.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Data && s.Name == "Memory Available");
+                var loadSensor = memoryHardware.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Load && s.Name == "Memory");
+
+                ramUsage = loadSensor?.Value ?? 0;
+                ramAvailable = (availableSensor?.Value ?? 0) * 1024 * 1024 * 1024; // Convert GB to bytes
+                ramTotal = ramAvailable + ((usedSensor?.Value ?? 0) * 1024 * 1024 * 1024); // Convert GB to bytes
+            }
+            else
+            {
+                // Fallback to performance counter or system info
+                var totalMemory = GC.GetTotalMemory(false);
+                ramUsage = 0;
+                ramAvailable = totalMemory;
+                ramTotal = totalMemory;
+            }
         }
 
         private float GetNetworkSpeed()
@@ -188,116 +201,102 @@ namespace TaskbarSystemMonitor
             }
         }
 
-        private Icon CreateCpuIcon()
+        private Icon CreateCpuIcon(float cpuUsage)
         {
-            return CreateSingleChart(cpuHistory, Color.Red, "CPU");
+            cpuHistory.Add(cpuUsage);
+            return CreateLineChart(cpuHistory, Color.Red, "CPU");
         }
 
-        private Icon CreateRamIcon()
+        private Icon CreateRamIcon(float ramUsage, float ramAvailable, float ramTotal)
         {
-            return CreateSingleChart(ramHistory, Color.Blue, "RAM");
+            ramHistory.Add(ramUsage);
+            return CreateLineChart(ramHistory, Color.Blue, "RAM");
         }
 
-        private Icon CreateNetworkIcon()
+        private Icon CreateNetworkIcon(float networkSpeed)
         {
-            return CreateSingleChart(networkHistory, Color.Green, "NET");
+            // For network, we might want to normalize the scale differently
+            // Let's assume max 100 MB/s for scaling purposes
+            float normalizedSpeed = Math.Min(networkSpeed * 100f / 100f, 100f);
+            networkHistory.Add(normalizedSpeed);
+            return CreateLineChart(networkHistory, Color.Green, "NET");
         }
 
-        private Icon CreateSingleChart(List<float> data, Color color, string label)
+        private Icon CreateLineChart(List<float> measurements, Color foregroundColor, string label)
         {
-            const int size = 32;
-            Bitmap bitmap = new Bitmap(size, size);
-
-            using (Graphics g = Graphics.FromImage(bitmap))
+            using (Bitmap bitmap = new Bitmap(ICON_SIZE, ICON_SIZE))
             {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.Clear(Color.Transparent);
-
-                // Use most of the icon space for the chart
-                Rectangle chartBounds = new Rectangle(2, 2, size - 4, size - 4);
-                DrawFullSizeChart(g, data, color, chartBounds, label);
-            }
-
-            return Icon.FromHandle(bitmap.GetHicon());
-        }
-
-        private void DrawFullSizeChart(Graphics g, List<float> data, Color color, Rectangle bounds, string label)
-        {
-            // Draw border
-            using (Pen borderPen = new Pen(Color.Orange, 2))
-            {
-                g.DrawRectangle(borderPen, bounds);
-            }
-
-            // Fill background with semi-transparent black
-            using (Brush bgBrush = new SolidBrush(Color.FromArgb(120, Color.Black)))
-            {
-                g.FillRectangle(bgBrush, bounds.X + 2, bounds.Y + 2, bounds.Width - 4, bounds.Height - 4);
-            }
-
-            if (data.Count < 2)
-            {
-                // If no data, show label
-                DrawLabel(g, label, bounds, color);
-                return;
-            }
-
-            // Draw chart area (inset from border)
-            Rectangle chartArea = new Rectangle(bounds.X + 3, bounds.Y + 3, bounds.Width - 6, bounds.Height - 6);
-
-            using (Pen pen = new Pen(color, 1.5f))
-            {
-                // Draw the chart line
-                for (int i = 1; i < Math.Min(data.Count, chartArea.Width); i++)
+                using (Graphics graphics = Graphics.FromImage(bitmap))
                 {
-                    int dataIndex1 = Math.Max(0, data.Count - chartArea.Width + i - 1);
-                    int dataIndex2 = Math.Max(0, data.Count - chartArea.Width + i);
+                    graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    graphics.Clear(backgroundColor);
 
-                    float x1 = chartArea.X + i - 1;
-                    float y1 = chartArea.Bottom - (data[dataIndex1] / 100f) * chartArea.Height;
-                    float x2 = chartArea.X + i;
-                    float y2 = chartArea.Bottom - (data[dataIndex2] / 100f) * chartArea.Height;
-
-                    // Ensure y coordinates are within bounds
-                    y1 = Math.Max(chartArea.Y, Math.Min(chartArea.Bottom, y1));
-                    y2 = Math.Max(chartArea.Y, Math.Min(chartArea.Bottom, y2));
-
-                    g.DrawLine(pen, x1, y1, x2, y2);
-                }
-
-                // Draw current value indicator
-                if (data.Count > 0)
-                {
-                    float currentValue = data.Last();
-                    float x = chartArea.Right - 2;
-                    float y = chartArea.Bottom - (currentValue / 100f) * chartArea.Height;
-                    y = Math.Max(chartArea.Y, Math.Min(chartArea.Bottom, y));
-
-                    using (Brush dotBrush = new SolidBrush(color))
+                    // Limit measurements to fit the bitmap width
+                    int maxPoints = bitmap.Width / POINT_WIDTH;
+                    if (measurements.Count > maxPoints)
                     {
-                        g.FillEllipse(dotBrush, x - 2, y - 2, 4, 4);
+                        measurements.RemoveAt(0);
                     }
-                }
-            }
 
-            // Draw percentage text if there's data
-            if (data.Count > 0)
-            {
-                string percentText = $"{data.Last():F0}%";
-                using (Font font = new Font("Arial", 7, FontStyle.Bold))
-                using (Brush textBrush = new SolidBrush(Color.White))
-                {
-                    SizeF textSize = g.MeasureString(percentText, font);
-                    float textX = bounds.X + (bounds.Width - textSize.Width) / 2;
-                    float textY = bounds.Bottom - textSize.Height - 2;
-
-                    // Draw text shadow for better visibility
-                    using (Brush shadowBrush = new SolidBrush(Color.Black))
+                    // Draw the line chart
+                    if (measurements.Count > 0)
                     {
-                        g.DrawString(percentText, font, shadowBrush, textX + 1, textY + 1);
+                        using (Pen linePen = new Pen(foregroundColor, POINT_WIDTH))
+                        {
+                            for (int i = measurements.Count - 1; i >= 0; i--)
+                            {
+                                float value = measurements[i];
+                                var pos = bitmap.Width - (measurements.Count - 1 - i) * POINT_WIDTH;
+
+                                // Calculate line height based on value (0-100%)
+                                float lineHeight = bitmap.Height * value / 100f;
+
+                                // Draw vertical line from bottom to the value height
+                                graphics.DrawLine(linePen,
+                                    pos, bitmap.Height - BORDER_WIDTH,
+                                    pos, bitmap.Height - lineHeight - BORDER_WIDTH);
+                            }
+                        }
                     }
-                    g.DrawString(percentText, font, textBrush, textX, textY);
+
+                    // Draw border
+                    using (Pen borderPen = new Pen(borderColor, BORDER_WIDTH))
+                    {
+                        graphics.DrawRectangle(borderPen, 0, 0,
+                            bitmap.Width - BORDER_WIDTH, bitmap.Height - BORDER_WIDTH);
+                    }
+
+                    // Draw current value text
+                    if (measurements.Count > 0)
+                    {
+                        float currentValue = measurements.Last();
+                        string valueText = $"{currentValue:F0}%";
+
+                        using (Font font = new Font("Arial", 6, FontStyle.Bold))
+                        using (Brush textBrush = new SolidBrush(Color.White))
+                        {
+                            SizeF textSize = graphics.MeasureString(valueText, font);
+                            float textX = (bitmap.Width - textSize.Width) / 2;
+                            float textY = bitmap.Height - textSize.Height - 2;
+
+                            // Draw text shadow for better visibility
+                            using (Brush shadowBrush = new SolidBrush(Color.Black))
+                            {
+                                graphics.DrawString(valueText, font, shadowBrush, textX + 1, textY + 1);
+                            }
+                            graphics.DrawString(valueText, font, textBrush, textX, textY);
+                        }
+                    }
+                    else
+                    {
+                        // If no data, show label
+                        DrawLabel(graphics, label, new Rectangle(0, 0, bitmap.Width, bitmap.Height), foregroundColor);
+                    }
+
+                    graphics.Save();
                 }
+
+                return Icon.FromHandle(bitmap.GetHicon());
             }
         }
 
